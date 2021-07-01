@@ -58,25 +58,29 @@ _ = gettext.gettext
 
 
 class Page:
-    def __init__(self, nfile, npage, zoom, filename, angle, scale, crop, size):
+    def __init__(self, nfile, npage, zoom, copyname, angle, scale, crop, size, basename):
         #: The ID (from 1 to n) of the PDF file owning the page
         self.nfile = nfile
         #: The ID (from 1 to n) of the page in its owner PDF document
         self.npage = npage
         self.zoom = zoom
-        self.filename = filename
+        #: Filepath to the temporary stored file
+        self.copyname = copyname
         #: Left, right, top, bottom crop
         self.crop = list(crop)
         #: width and height
         self.size = list(size)
         self.angle = angle
         self.thumbnail = None
-        self.resample = 2
+        self.resample = -1
+        #: A low resolution thumbnail
+        self.preview = None
         self.scale = scale
+        #: The name of the original file
+        self.basename = basename
 
     def description(self):
-        shortname = os.path.split(self.filename)[1]
-        shortname = os.path.splitext(shortname)[0]
+        shortname = os.path.splitext(self.basename)[0]
         return "".join([shortname, "\n", _("page"), " ", str(self.npage)])
 
     def width_in_points(self):
@@ -97,21 +101,31 @@ class Page:
     def height_in_pixel(self):
         return int(0.5 + self.zoom * self.height_in_points())
 
-    def rotate(self, angle):
-        rotate_times = int(round(((-angle) % 360) / 90) % 4)
-        if rotate_times == 0:
-            return False
+    @staticmethod
+    def rotate_times(angle):
+        """Convert an angle in degree to a number of 90° rotation (integer)"""
+        return int(round(((-angle) % 360) / 90) % 4)
+
+    @staticmethod
+    def rotate_crop(croparray, rotate_times):
+        """Rotate a given crop array (left, right, top bottom) a number of time"""
         perm = [0, 2, 1, 3]
         for __ in range(rotate_times):
             perm.append(perm.pop(0))
         perm.insert(1, perm.pop(2))
-        self.crop = [self.crop[x] for x in perm]
+        return [croparray[x] for x in perm]
+
+    def rotate(self, angle):
+        rt = self.rotate_times(angle)
+        if rt == 0:
+            return False
+        self.crop = self.rotate_crop(self.crop, rt)
         self.angle = (self.angle + int(angle)) % 360
         return True
 
     def serialize(self):
         """Convert to string for copy/past operations."""
-        ts = [self.filename, self.npage, self.angle, self.scale] + list(self.crop)
+        ts = [self.copyname, self.npage, self.basename, self.angle, self.scale] + list(self.crop)
         return "\n".join([str(v) for v in ts])
 
     def duplicate(self, incl_thumbnail=True):
@@ -121,6 +135,8 @@ class Page:
         if incl_thumbnail == False:
             del r.thumbnail  # to save ram
             r.thumbnail = None
+            r.resample = -1
+            r.preview = None
         return r
 
     def set_size(self, size):
@@ -183,7 +199,7 @@ class PasswordDialog(Gtk.Dialog):
             ),
         )
         self.set_default_response(Gtk.ResponseType.OK)
-        bottommsg = _("The password will be remembered until you close PDF-Arranger.")
+        bottommsg = _("The password will be remembered until you close PDF Arranger.")
         topmsg = _("The document “{}” is locked and requires a password before it can be opened.")
         label = Gtk.Label(label=topmsg.format(filename))
         label.set_max_width_chars(len(bottommsg)-6)
@@ -214,14 +230,13 @@ class PasswordDialog(Gtk.Dialog):
 class PDFDoc:
     """Class handling PDF documents."""
 
-    def __from_file(self, parent):
+    def __from_file(self, parent, basename):
         uri = pathlib.Path(self.copyname).as_uri()
         askpass = False
         while True:
             try:
                 if askpass:
-                    bn = os.path.basename(self.filename)
-                    self.password = PasswordDialog(parent, bn).get_password()
+                    self.password = PasswordDialog(parent, basename).get_password()
                 self.document = Poppler.Document.new_from_file(uri, self.password)
                 # When there is no encryption Poppler want None as password
                 # while PikePDF want an empty string
@@ -232,34 +247,43 @@ class PDFDoc:
                 if not askpass:
                     raise e
 
-    def __init__(self, filename, tmp_dir, parent):
+    def __init__(self, filename, basename, tmp_dir, parent):
+        self.render_lock = threading.Lock()
         self.filename = os.path.abspath(filename)
-        self.mtime = os.path.getmtime(filename)
+        try:
+            self.mtime = os.path.getmtime(filename)
+        except OSError as e:
+            raise PDFDocError(e)
+        if basename is None:  # When importing files
+            self.basename = os.path.basename(filename)
+        else:  # When copy-pasting
+            self.basename = basename
         self.password = ""
         filemime = mimetypes.guess_type(self.filename)[0]
         if not filemime:
             raise PDFDocError(_("Unknown file format"))
         if filemime == "application/pdf":
-            if self.filename.startswith(tmp_dir):
+            if self.filename.startswith(tmp_dir) and basename is None:
                 # In the "Insert Blank Page" we don't need to copy self.filename
                 self.copyname = self.filename
+                self.basename = ""
             else:
-                fd, self.copyname = tempfile.mkstemp(dir=tmp_dir)
+                fd, self.copyname = tempfile.mkstemp(suffix=".pdf", dir=tmp_dir)
                 os.close(fd)
                 shutil.copy(self.filename, self.copyname)
             try:
-                self.__from_file(parent)
+                self.__from_file(parent, self.basename)
             except GLib.Error as e:
                 raise PDFDocError(e.message + ": " + filename)
         elif filemime.split("/")[0] == "image":
             if not img2pdf:
                 raise PDFDocError(_("Image files are only supported with img2pdf"))
             if mimetypes.guess_type(filename)[0] in img2pdf_supported_img:
-                fd, self.copyname = tempfile.mkstemp(dir=tmp_dir)
+                fd, self.copyname = tempfile.mkstemp(suffix=".pdf", dir=tmp_dir)
                 os.close(fd)
                 with open(self.copyname, "wb") as f:
                     img = img2pdf.Image.open(filename)
-                    if img.mode != "RGBA" and "transparency" in img.info:
+                    if (img.mode == "LA") or (img.mode != "RGBA" and "transparency" in img.info):
                         # TODO: Find a way to keep image in P or L format and remove transparency.
                         # This will work but converting from 1, L, P to RGB is not optimal.
                         img = img.convert("RGBA")
@@ -298,30 +322,35 @@ class PageAdder:
         self.before = before
         self.treerowref = treerowref
 
-    def addpages(self, filename, page=-1, angle=0, scale=1.0, crop=None):
+    def addpages(self, filename, page=-1, basename=None, angle=0, scale=1.0, crop=None):
         crop = [0] * 4 if crop is None else crop
         pdfdoc = None
         nfile = None
+        # Check if added page or file already exist in pdfqueue
         for i, it_pdfdoc in enumerate(self.app.pdfqueue):
-            if (
-                os.path.isfile(it_pdfdoc.filename)
-                and os.path.samefile(filename, it_pdfdoc.filename)
-                and os.path.getmtime(filename) is it_pdfdoc.mtime
-            ):
+            if basename is not None and filename == it_pdfdoc.copyname:
+                # File of copy-pasted page was found in pdfqueue
+                pdfdoc = it_pdfdoc
+                nfile = i + 1
+                break
+            elif (os.path.isfile(it_pdfdoc.filename)
+                  and os.path.samefile(filename, it_pdfdoc.filename)
+                  and os.path.getmtime(filename) == it_pdfdoc.mtime):
+                # Imported file was found in pdfqueue
                 pdfdoc = it_pdfdoc
                 nfile = i + 1
                 break
 
         if not pdfdoc:
             try:
-                pdfdoc = PDFDoc(filename, self.app.tmp_dir, self.app.window)
+                pdfdoc = PDFDoc(filename, basename, self.app.tmp_dir, self.app.window)
             except _UnknownPasswordException:
                 return
             except PDFDocError as e:
                 print(e.message, file=sys.stderr)
                 self.app.error_message_dialog(e.message)
                 return
-            if pdfdoc.copyname != pdfdoc.filename:
+            if pdfdoc.copyname != pdfdoc.filename and basename is None:
                 self.app.import_directory = os.path.split(filename)[0]
                 self.app.export_directory = self.app.import_directory
             self.app.pdfqueue.append(pdfdoc)
@@ -339,11 +368,12 @@ class PageAdder:
                     nfile,
                     npage,
                     self.app.zoom_scale,
-                    pdfdoc.filename,
+                    pdfdoc.copyname,
                     angle,
                     scale,
                     crop,
                     page.get_size(),
+                    pdfdoc.basename,
                 )
             )
 
@@ -353,6 +383,7 @@ class PageAdder:
         if add_to_undomanager:
             self.app.undomanager.commit("Add")
             self.app.set_unsaved(True)
+        self.app.model_lock()
         for p in self.pages:
             m = [p, p.description()]
             if self.treerowref:
@@ -367,67 +398,126 @@ class PageAdder:
                 path = self.app.model.get_path(it)
                 self.app.iconview.select_path(path)
             self.app.update_geometry(it)
-        GObject.idle_add(self.app.retitle)
-        GObject.idle_add(self.app.render)
+        self.app.model_unlock()
+        if add_to_undomanager:
+            GObject.idle_add(self.app.retitle)
+            self.app.zoom_set(self.app.zoom_level)
+            self.app.silent_render()
         self.pages = []
         return True
 
 
 class PDFRenderer(threading.Thread, GObject.GObject):
-    def __init__(self, model, pdfqueue, resample, start_p):
+    def __init__(self, model, pdfqueue, visible_range, columns_nr):
         threading.Thread.__init__(self)
         GObject.GObject.__init__(self)
         self.model = model
         self.pdfqueue = pdfqueue
-        self.resample = resample
+        self.visible_start = visible_range[0]
+        self.visible_end = visible_range[1]
+        self.columns_nr = columns_nr
+        self.mem_usage = 0
+        self.model_lock = threading.Lock()
         self.quit = False
-        self.start_p = start_p
 
     def run(self):
-        idx = -1  # signal rendering (re)started for progressbar
-        GObject.idle_add(
-            self.emit, "update_thumbnail", idx, None, 0.0, priority=GObject.PRIORITY_LOW
-        )
-        if self.start_p == 0:
-            for idx, row in enumerate(self.model):
-                self.update(idx, row)
-        else:
-            # Rendering order: begin from start_p, then expand around start_p
-            self.update(self.start_p, self.model[self.start_p])
-            for cnt in range(1, len(self.model)):
-                previous_p = self.start_p - cnt
-                next_p = self.start_p + cnt
-                if previous_p < 0 and next_p > len(self.model):
-                    return
-                if previous_p >= 0:
-                    self.update(previous_p, self.model[previous_p])
-                if next_p < len(self.model):
-                    self.update(next_p, self.model[next_p])
-        idx = -2  # signal rendering ended
-        GObject.idle_add(
-            self.emit, "update_thumbnail", idx, None, 0.0, priority=GObject.PRIORITY_LOW
-        )
+        """Render thumbnails and less memory consuming previews.
 
-    def update(self, idx, row):
-        p = row[0]
-        if self.quit:
-            return
+        Thumbnails are rendered for the visible range and its near area. Memory usage is estimated
+        and if it goes too high distant thumbnails are replaced with previews. Previews will be
+        rendered for all pages. The preview will exist as long as the page exist.
+        """
+        for num in range(self.visible_start, self.visible_end + 1):
+            if self.quit:
+                return
+            with self.model_lock:
+                if not 0 <= num < len(self.model):
+                    break
+                path = Gtk.TreePath.new_from_indices([num])
+                ref = Gtk.TreeRowReference.new(self.model, path)
+                p = copy.copy(self.model[path][0])
+            if p.resample != 1 / p.zoom:
+                scale = p.scale * p.zoom
+                self.update(p, ref, scale, 1 / p.zoom, False)
+        mem_limit = False
+        for off in range(1, len(self.model)):
+            for num in self.visible_end + off, self.visible_start - off:
+                if self.quit:
+                    return
+                with self.model_lock:
+                    if not 0 <= num < len(self.model):
+                        continue
+                    path = Gtk.TreePath.new_from_indices([num])
+                    ref = Gtk.TreeRowReference.new(self.model, path)
+                    p = copy.copy(self.model[path][0])
+                if off <= self.columns_nr * 5:
+                    # Thumbnail
+                    scale = p.scale * p.zoom
+                    resample = 1 / p.zoom
+                    is_preview = False
+                elif mem_limit or p.resample < 0:
+                    # Preview. Always render to about 4000 pixels = about 16kb
+                    preview_zoom_scale = (1 / p.scale) * (4000 / (p.size[0] * p.size[1])) ** .5
+                    scale = p.scale * preview_zoom_scale
+                    resample = 1 / preview_zoom_scale
+                    is_preview = True
+                else:
+                    # Thumbnail is distant and total mem usage is small
+                    # -> don't update thumbnail, just take memory usage into account
+                    scale = p.scale / p.resample
+                    resample = p.resample
+                mem_limit = self.mem_at_limit(p, scale)
+                if p.resample != resample:
+                    self.update(p, ref, scale, resample, is_preview)
+        self.finish()
+
+    def mem_at_limit(self, p, scale):
+        """Estimate memory usage of rendered thumbnails. Return True when mem_usage > mem_limit."""
+        mem_limit = 300  # Mb (About. Size will depend on thumbnail content.)
+        if self.mem_usage > mem_limit:
+            return True
         pdfdoc = self.pdfqueue[p.nfile - 1]
         page = pdfdoc.document.get_page(p.npage - 1)
         w, h = page.get_size()
-        scale = p.scale / self.resample
-        thumbnail = cairo.ImageSurface(
-            cairo.FORMAT_ARGB32, int(w * scale), int(h * scale)
-        )
-        cr = cairo.Context(thumbnail)
-        if scale != 1.0:
-            cr.scale(scale, scale)
-        page.render(cr)
+        self.mem_usage += w * scale * h * scale * 4 / (1024 * 1024)  # 4 byte/pixel
+
+    def update(self, p, ref, scale, resample, is_preview):
+        """Render and emit updated thumbnails."""
+        if self.quit:
+            return
+        if is_preview and p.preview:
+            thumbnail = p.preview
+        else:
+            pdfdoc = self.pdfqueue[p.nfile - 1]
+            page = pdfdoc.document.get_page(p.npage - 1)
+            w, h = page.get_size()
+            thumbnail = cairo.ImageSurface(
+                cairo.FORMAT_ARGB32, int(0.5 + w * scale), int(0.5 + h * scale)
+            )
+            cr = cairo.Context(thumbnail)
+            cr.scale(int(0.5 + w * scale) / w, int(0.5 + h * scale) / h)
+            with pdfdoc.render_lock:
+                page.render(cr)
         GObject.idle_add(
             self.emit,
             "update_thumbnail",
-            idx,
+            ref,
             thumbnail,
-            self.resample,
+            resample,
+            p.scale,
+            is_preview,
+            priority=GObject.PRIORITY_LOW,
+        )
+
+    def finish(self):
+        """Signal rendering ended (for statusbar and malloc_trim)."""
+        GObject.idle_add(
+            self.emit,
+            "update_thumbnail",
+            None,
+            None,
+            0,
+            0,
+            False,
             priority=GObject.PRIORITY_LOW,
         )
